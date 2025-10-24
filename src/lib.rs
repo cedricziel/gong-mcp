@@ -1,8 +1,4 @@
-use rmcp::{
-    model::*,
-    ErrorData as McpError, RoleServer, ServerHandler,
-    service::RequestContext,
-};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, model::*, service::RequestContext};
 use serde_json::json;
 use std::sync::Arc;
 

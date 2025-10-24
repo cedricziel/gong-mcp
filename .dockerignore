@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# CI/CD
+.github
+
+# Rust build artifacts
+target/
+debug/
+**/*.rs.bk
+
+# Documentation
+README.md
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
