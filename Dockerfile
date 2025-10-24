@@ -9,20 +9,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests
-COPY Cargo.toml ./
-COPY Cargo.lock ./
-
-# Create a dummy source to cache dependencies
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "pub fn dummy() {}" > src/lib.rs
-
-# Build dependencies only (this layer will be cached)
-RUN cargo build --release && \
-    rm -rf src target/release/gong-mcp* target/release/deps/gong_mcp*
-
-# Copy actual source code
+# Copy manifests and source
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Build the application
