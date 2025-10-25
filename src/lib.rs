@@ -1,17 +1,17 @@
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, model::*, service::RequestContext};
 use serde_json::json;
 use std::sync::Arc;
-use base64::{Engine as _, engine::general_purpose};
+use gong_rs::apis::configuration::Configuration;
+use gong_rs::apis::{calls_api, users_api};
+use gong_rs::models;
 
 /// Gong MCP Server
 ///
 /// This server exposes Gong calls as MCP resources.
 #[derive(Clone)]
 pub struct GongServer {
-    // Configuration
-    base_url: Arc<Option<String>>,
-    access_key: Arc<Option<String>>,
-    access_key_secret: Arc<Option<String>>,
+    // Gong API configuration
+    config: Arc<Option<Configuration>>,
 }
 
 impl GongServer {
@@ -21,10 +21,20 @@ impl GongServer {
         let access_key = std::env::var("GONG_ACCESS_KEY").ok();
         let access_key_secret = std::env::var("GONG_ACCESS_KEY_SECRET").ok();
 
+        // Create gong-rs configuration if all required variables are present
+        let config = if let (Some(base_url), Some(access_key), Some(access_key_secret)) =
+            (base_url, access_key, access_key_secret)
+        {
+            let mut config = Configuration::new();
+            config.base_path = base_url;
+            config.basic_auth = Some((access_key, Some(access_key_secret)));
+            Some(config)
+        } else {
+            None
+        };
+
         Self {
-            base_url: Arc::new(base_url),
-            access_key: Arc::new(access_key),
-            access_key_secret: Arc::new(access_key_secret),
+            config: Arc::new(config),
         }
     }
 
@@ -42,151 +52,98 @@ impl GongServer {
     }
 
     fn _is_configured(&self) -> bool {
-        self.base_url.is_some() && self.access_key.is_some() && self.access_key_secret.is_some()
-    }
-
-    /// Create an authenticated HTTP client for Gong API calls
-    fn _create_http_client(&self) -> Result<reqwest::Client, McpError> {
-        let access_key = self
-            .access_key
-            .as_ref()
-            .as_ref()
-            .ok_or_else(|| McpError::invalid_request("missing_access_key", None))?;
-        let access_key_secret = self
-            .access_key_secret
-            .as_ref()
-            .as_ref()
-            .ok_or_else(|| McpError::invalid_request("missing_access_key_secret", None))?;
-
-        let client = reqwest::Client::builder()
-            .default_headers({
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(
-                    reqwest::header::AUTHORIZATION,
-                    reqwest::header::HeaderValue::from_str(&format!(
-                        "Basic {}",
-                        general_purpose::STANDARD.encode(format!("{}:{}", access_key, access_key_secret))
-                    ))
-                    .map_err(|e| {
-                        McpError::internal_error("header_error", Some(json!({"error": e.to_string()})))
-                    })?,
-                );
-                headers.insert(
-                    reqwest::header::CONTENT_TYPE,
-                    reqwest::header::HeaderValue::from_static("application/json"),
-                );
-                headers
-            })
-            .build()
-            .map_err(|e| {
-                McpError::internal_error("client_error", Some(json!({"error": e.to_string()})))
-            })?;
-
-        Ok(client)
+        self.config.is_some()
     }
 
     /// Fetch list of calls from Gong API
-    async fn _fetch_calls(&self) -> Result<serde_json::Value, McpError> {
-        let base_url = self
-            .base_url
+    async fn _fetch_calls(&self) -> Result<models::Calls, McpError> {
+        let config = self
+            .config
             .as_ref()
             .as_ref()
-            .ok_or_else(|| McpError::invalid_request("missing_base_url", None))?;
-
-        let client = self._create_http_client()?;
-        let url = format!("{}/v2/calls", base_url);
+            .ok_or_else(|| McpError::invalid_request("not_configured", None))?;
 
         // Fetch calls from the last 7 days
         let from_date_time = chrono::Utc::now() - chrono::Duration::days(7);
-        let body = json!({
-            "filter": {
-                "fromDateTime": from_date_time.to_rfc3339(),
-            },
-            "contentSelector": {
-                "exposedFields": {
-                    "content": true,
-                    "parties": true,
-                }
-            }
-        });
 
-        let response = client
-            .post(&url)
-            .json(&body)
-            .send()
+        let params = calls_api::ListCallsExtensiveParams {
+            public_api_base_request_with_data_v2_calls_request_filter_with_owners_content_selector:
+                models::PublicApiBaseRequestWithDataV2CallsRequestFilterWithOwnersContentSelector {
+                    cursor: None,
+                    filter: Box::new(models::CallsRequestFilterWithOwners {
+                        from_date_time: Some(from_date_time.to_rfc3339()),
+                        to_date_time: None,
+                        workspace_id: None,
+                        call_ids: None,
+                        primary_user_ids: None,
+                    }),
+                    content_selector: Some(Box::new(models::ContentSelector {
+                        context: None,
+                        context_timing: None,
+                        exposed_fields: Some(Box::new(models::ExposedFields {
+                            collaboration: None,
+                            content: Some(Box::new(models::CallContent {
+                                structure: Some(true),
+                                topics: None,
+                                trackers: None,
+                                tracker_occurrences: None,
+                                points_of_interest: None,
+                                brief: None,
+                                outline: None,
+                                highlights: None,
+                                call_outcome: None,
+                                key_points: None,
+                            })),
+                            parties: Some(true),
+                            interaction: None,
+                            media: None,
+                        })),
+                    })),
+                },
+        };
+
+        calls_api::list_calls_extensive(config, params)
             .await
             .map_err(|e| {
                 McpError::internal_error("api_error", Some(json!({"error": e.to_string()})))
-            })?;
-
-        if !response.status().is_success() {
-            return Err(McpError::internal_error(
-                "api_error",
-                Some(json!({
-                    "status": response.status().as_u16(),
-                    "error": response.text().await.unwrap_or_default()
-                })),
-            ));
-        }
-
-        let data = response.json::<serde_json::Value>().await.map_err(|e| {
-            McpError::internal_error("parse_error", Some(json!({"error": e.to_string()})))
-        })?;
-
-        Ok(data)
+            })
     }
 
     /// Fetch transcript for a specific call by ID
-    async fn _fetch_transcript(&self, call_id: &str) -> Result<serde_json::Value, McpError> {
-        let base_url = self
-            .base_url
+    async fn _fetch_transcript(&self, call_id: &str) -> Result<models::CallTranscripts, McpError> {
+        let config = self
+            .config
             .as_ref()
             .as_ref()
-            .ok_or_else(|| McpError::invalid_request("missing_base_url", None))?;
+            .ok_or_else(|| McpError::invalid_request("not_configured", None))?;
 
-        let client = self._create_http_client()?;
-        let url = format!("{}/v2/calls/transcript", base_url);
+        let filter = models::CallsFilter {
+            from_date_time: None,
+            to_date_time: None,
+            workspace_id: None,
+            call_ids: Some(vec![call_id.to_string()]),
+        };
 
-        let body = json!({
-            "filter": {
-                "callIds": [call_id]
-            }
-        });
+        let params = calls_api::GetCallTranscriptsParams {
+            public_api_base_request_v2_calls_filter: models::PublicApiBaseRequestV2CallsFilter {
+                cursor: None,
+                filter: Box::new(filter),
+            },
+        };
 
-        let response = client
-            .post(&url)
-            .json(&body)
-            .send()
+        calls_api::get_call_transcripts(config, params)
             .await
             .map_err(|e| {
-                McpError::internal_error("api_error", Some(json!({"error": e.to_string()})))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-
-            if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(McpError::resource_not_found(
-                    "call_not_found",
-                    Some(json!({"callId": call_id})),
-                ));
-            }
-
-            return Err(McpError::internal_error(
-                "api_error",
-                Some(json!({
-                    "status": status.as_u16(),
-                    "error": error_text
-                })),
-            ));
-        }
-
-        let data = response.json::<serde_json::Value>().await.map_err(|e| {
-            McpError::internal_error("parse_error", Some(json!({"error": e.to_string()})))
-        })?;
-
-        Ok(data)
+                let error_str = e.to_string();
+                if error_str.contains("404") || error_str.contains("not found") {
+                    McpError::resource_not_found(
+                        "call_not_found",
+                        Some(json!({"callId": call_id, "error": error_str})),
+                    )
+                } else {
+                    McpError::internal_error("api_error", Some(json!({"error": error_str})))
+                }
+            })
     }
 }
 
@@ -264,9 +221,15 @@ impl ServerHandler for GongServer {
         match uri.as_str() {
             "gong://status" => {
                 let status = if self._is_configured() {
+                    let base_url = self
+                        .config
+                        .as_ref()
+                        .as_ref()
+                        .map(|c| c.base_path.as_str())
+                        .unwrap_or("unknown");
                     json!({
                         "configured": true,
-                        "base_url": self.base_url.as_ref().as_ref().unwrap(),
+                        "base_url": base_url,
                         "message": "Gong API is configured and ready to use"
                     })
                 } else {
@@ -297,18 +260,19 @@ impl ServerHandler for GongServer {
                 let calls_data = self._fetch_calls().await?;
 
                 // Extract and format the calls for easier consumption
-                let formatted_response = if let Some(calls) = calls_data.get("calls").and_then(|c| c.as_array()) {
+                let formatted_response = if let Some(calls) = calls_data.calls {
                     let formatted_calls: Vec<serde_json::Value> = calls
                         .iter()
                         .map(|call| {
+                            let meta = call.meta_data.as_ref().map(|m| m.as_ref());
                             json!({
-                                "id": call.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                                "title": call.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled"),
-                                "started": call.get("started").and_then(|v| v.as_str()).unwrap_or(""),
-                                "duration": call.get("duration").and_then(|v| v.as_i64()).unwrap_or(0),
-                                "direction": call.get("direction").and_then(|v| v.as_str()).unwrap_or(""),
-                                "parties": call.get("parties").cloned().unwrap_or(json!([])),
-                                "url": call.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                                "id": meta.and_then(|m| m.id.as_ref()).unwrap_or(&String::new()),
+                                "title": meta.and_then(|m| m.title.as_ref()).unwrap_or(&"Untitled".to_string()),
+                                "started": meta.and_then(|m| m.started.as_ref()).unwrap_or(&String::new()),
+                                "duration": meta.and_then(|m| m.duration).unwrap_or(0),
+                                "direction": meta.and_then(|m| m.direction.as_ref()).map(|d| format!("{:?}", d)).unwrap_or_default(),
+                                "parties": call.parties.as_ref().map(|p| json!(p)).unwrap_or(json!([])),
+                                "url": meta.and_then(|m| m.url.as_ref()).unwrap_or(&String::new()),
                             })
                         })
                         .collect();
@@ -343,16 +307,55 @@ impl ServerHandler for GongServer {
                     ));
                 }
 
-                // TODO: Implement actual Gong API call to fetch users
-                // For now, return a placeholder
-                let users_data = json!({
-                    "message": "Gong users resource - Coming soon",
-                    "note": "This will fetch users from the Gong API using gong-rs library"
-                });
+                // Fetch users from Gong API
+                let config = self
+                    .config
+                    .as_ref()
+                    .as_ref()
+                    .ok_or_else(|| McpError::invalid_request("not_configured", None))?;
+
+                let params = users_api::ListUsersParams {
+                    cursor: None,
+                    include_avatars: Some(false),
+                };
+
+                let users_data = users_api::list_users(config, params)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error("api_error", Some(json!({"error": e.to_string()})))
+                    })?;
+
+                // Format the users response
+                let formatted_response = if let Some(users) = users_data.users {
+                    let formatted_users: Vec<serde_json::Value> = users
+                        .iter()
+                        .map(|user| {
+                            json!({
+                                "id": user.id.as_ref().unwrap_or(&String::new()),
+                                "email": user.email_address.as_ref().unwrap_or(&String::new()),
+                                "firstName": user.first_name.as_ref().unwrap_or(&String::new()),
+                                "lastName": user.last_name.as_ref().unwrap_or(&String::new()),
+                                "active": user.active.unwrap_or(false),
+                            })
+                        })
+                        .collect();
+
+                    json!({
+                        "users": formatted_users,
+                        "count": formatted_users.len(),
+                        "message": format!("Retrieved {} users", formatted_users.len())
+                    })
+                } else {
+                    json!({
+                        "users": [],
+                        "count": 0,
+                        "message": "No users found"
+                    })
+                };
 
                 Ok(ReadResourceResult {
                     contents: vec![ResourceContents::text(
-                        serde_json::to_string_pretty(&users_data).unwrap(),
+                        serde_json::to_string_pretty(&formatted_response).unwrap(),
                         uri,
                     )],
                 })
@@ -397,22 +400,54 @@ impl ServerHandler for GongServer {
                     let transcript_data = self._fetch_transcript(call_id).await?;
 
                     // Format the transcript response with metadata
-                    let formatted_response = if let Some(transcripts) = transcript_data.get("callTranscripts").and_then(|t| t.as_array()) {
+                    let formatted_response = if let Some(transcripts) = transcript_data.call_transcripts {
                         if let Some(transcript) = transcripts.first() {
-                            let call_id = transcript.get("callId").and_then(|v| v.as_str()).unwrap_or("");
-                            let transcript_obj = transcript.get("transcript").cloned().unwrap_or(json!(null));
+                            let empty_string = String::new();
+                            let retrieved_call_id = transcript.call_id.as_ref().unwrap_or(&empty_string);
+                            let monologues = transcript.transcript.as_ref();
 
-                            // Extract speakers and sentences if available
-                            let speakers = transcript_obj.get("speakers").cloned().unwrap_or(json!([]));
-                            let sentences = transcript_obj.get("sentences").cloned().unwrap_or(json!([]));
+                            // Extract sentences and speaker information from monologues
+                            let (all_sentences, speaker_ids): (Vec<_>, Vec<_>) = monologues
+                                .map(|m| {
+                                    m.iter()
+                                        .flat_map(|monologue| {
+                                            let speaker_id = monologue.speaker_id.clone();
+                                            monologue.sentences.as_ref().map(|sentences| {
+                                                sentences
+                                                    .iter()
+                                                    .map(|s| {
+                                                        (
+                                                            json!({
+                                                                "speakerId": speaker_id,
+                                                                "start": s.start,
+                                                                "end": s.end,
+                                                                "text": s.text,
+                                                            }),
+                                                            speaker_id.clone(),
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default()
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                                .into_iter()
+                                .unzip();
+
+                            // Get unique speakers
+                            let unique_speakers: std::collections::HashSet<_> =
+                                speaker_ids.into_iter().flatten().collect();
 
                             json!({
-                                "callId": call_id,
-                                "speakers": speakers,
-                                "sentences": sentences,
+                                "callId": retrieved_call_id,
+                                "monologues": monologues,
+                                "sentences": all_sentences,
                                 "metadata": {
-                                    "sentenceCount": sentences.as_array().map(|s| s.len()).unwrap_or(0),
-                                    "speakerCount": speakers.as_array().map(|s| s.len()).unwrap_or(0),
+                                    "sentenceCount": all_sentences.len(),
+                                    "speakerCount": unique_speakers.len(),
+                                    "monologueCount": monologues.map(|m| m.len()).unwrap_or(0),
                                 }
                             })
                         } else {
@@ -490,7 +525,7 @@ mod tests {
     #[test]
     fn test_server_creation() {
         let server = GongServer::new();
-        assert!(server.base_url.is_none() || server.base_url.is_some());
+        assert!(server.config.is_none() || server.config.is_some());
     }
 
     #[test]
@@ -568,13 +603,5 @@ mod tests {
             std::env::remove_var("GONG_ACCESS_KEY");
             std::env::remove_var("GONG_ACCESS_KEY_SECRET");
         }
-    }
-
-    #[test]
-    fn test_base64_encoding() {
-        // Test that base64 encoding works correctly
-        let encoded = general_purpose::STANDARD.encode("test:secret");
-        assert!(!encoded.is_empty());
-        assert_eq!(encoded, "dGVzdDpzZWNyZXQ=");
     }
 }

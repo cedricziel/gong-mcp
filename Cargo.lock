@@ -344,10 +344,8 @@ name = "gong-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "chrono",
  "gong-rs",
- "reqwest",
  "rmcp",
  "serde",
  "serde_json",
