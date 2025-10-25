@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gong": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": [
+        "run"
+      ],
+      "env": {}
+    }
+  }
+}
