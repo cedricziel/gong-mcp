@@ -155,6 +155,33 @@ impl GongServer {
                 }
             })
     }
+
+    /// Fetch metadata for a specific call by ID
+    async fn _fetch_call(&self, call_id: &str) -> Result<models::SpecificCall, McpError> {
+        let config = self
+            .config
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_request("not_configured", None))?;
+
+        let params = calls_api::GetCallParams {
+            id: call_id.to_string(),
+        };
+
+        calls_api::get_call(config, params)
+            .await
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("404") || error_str.contains("not found") {
+                    McpError::resource_not_found(
+                        "call_not_found",
+                        Some(json!({"callId": call_id, "error": error_str})),
+                    )
+                } else {
+                    McpError::internal_error("api_error", Some(json!({"error": error_str})))
+                }
+            })
+    }
 }
 
 impl Default for GongServer {
@@ -433,6 +460,82 @@ impl ServerHandler for GongServer {
                             uri,
                         )],
                     })
+                } else if uri.starts_with("gong://calls/") {
+                    // Check if it matches the call metadata pattern: gong://calls/{callId}
+                    if !self._is_configured() {
+                        return Err(McpError::invalid_request(
+                            "not_configured",
+                            Some(json!({
+                                "message": "Gong API is not configured. Please set environment variables."
+                            })),
+                        ));
+                    }
+
+                    // Extract call ID from URI
+                    let call_id = uri.strip_prefix("gong://calls/").ok_or_else(|| {
+                        McpError::invalid_params(
+                            "invalid_uri",
+                            Some(json!({
+                                "message": "Invalid URI format. Expected: gong://calls/{callId}",
+                                "uri": uri
+                            })),
+                        )
+                    })?;
+
+                    // Validate call ID is not empty
+                    if call_id.is_empty() {
+                        return Err(McpError::invalid_params(
+                            "missing_call_id",
+                            Some(json!({
+                                "message": "Call ID cannot be empty"
+                            })),
+                        ));
+                    }
+
+                    // Fetch call metadata from Gong API
+                    let call_data = self._fetch_call(call_id).await?;
+
+                    // Format the call metadata response
+                    let formatted_response = if let Some(call) = call_data.call {
+                        let call = call.as_ref();
+                        json!({
+                            "id": call.id,
+                            "url": call.url,
+                            "title": call.title,
+                            "scheduled": call.scheduled,
+                            "started": call.started,
+                            "duration": call.duration,
+                            "direction": call.direction.as_ref().map(|d| format!("{:?}", d)),
+                            "primaryUserId": call.primary_user_id,
+                            "system": call.system,
+                            "scope": call.scope.as_ref().map(|s| format!("{:?}", s)),
+                            "media": call.media.as_ref().map(|m| format!("{:?}", m)),
+                            "language": call.language,
+                            "workspaceId": call.workspace_id,
+                            "sdrDisposition": call.sdr_disposition,
+                            "clientUniqueId": call.client_unique_id,
+                            "customData": call.custom_data,
+                            "purpose": call.purpose,
+                            "meetingUrl": call.meeting_url,
+                            "isPrivate": call.is_private,
+                            "calendarEventId": call.calendar_event_id,
+                        })
+                    } else {
+                        return Err(McpError::resource_not_found(
+                            "call_not_found",
+                            Some(json!({
+                                "callId": call_id,
+                                "message": "No call data returned from API"
+                            })),
+                        ));
+                    };
+
+                    Ok(ReadResourceResult {
+                        contents: vec![ResourceContents::text(
+                            serde_json::to_string_pretty(&formatted_response).unwrap(),
+                            uri,
+                        )],
+                    })
                 } else {
                     // Unknown resource
                     Err(McpError::resource_not_found(
@@ -459,6 +562,16 @@ impl ServerHandler for GongServer {
         }
 
         let templates = vec![
+            RawResourceTemplate {
+                uri_template: "gong://calls/{callId}".to_string(),
+                name: "Call Metadata".to_string(),
+                title: None,
+                description: Some(
+                    "Retrieve full metadata for a specific Gong call by ID".to_string(),
+                ),
+                mime_type: Some("application/json".to_string()),
+            }
+            .no_annotation(),
             RawResourceTemplate {
                 uri_template: "gong://calls/{callId}/transcript".to_string(),
                 name: "Call Transcript".to_string(),
@@ -855,5 +968,159 @@ mod tests {
                     .collect::<Vec<String>>()
             });
         assert_eq!(call_ids, Some(vec!["call1".to_string(), "call2".to_string()]));
+    }
+
+    #[test]
+    fn test_call_metadata_uri_parsing() {
+        // Valid call metadata URIs (without /transcript)
+        let valid_uris = vec![
+            "gong://calls/123456",
+            "gong://calls/abc-def-123",
+            "gong://calls/call_id_123",
+        ];
+
+        for uri in valid_uris {
+            let call_id = uri.strip_prefix("gong://calls/");
+            assert!(call_id.is_some(), "Failed to parse URI: {}", uri);
+            assert!(!call_id.unwrap().is_empty(), "Call ID is empty for URI: {}", uri);
+            // Should NOT contain /transcript
+            assert!(!call_id.unwrap().contains("/transcript"), "Call metadata URI should not contain /transcript: {}", uri);
+        }
+    }
+
+    #[test]
+    fn test_invalid_call_metadata_uri_parsing() {
+        let invalid_uris = vec![
+            "gong://calls/",         // empty call ID
+            "gong://calls",          // missing call ID separator
+            "gong://call/123",       // wrong format (call vs calls)
+        ];
+
+        for uri in invalid_uris {
+            let call_id = uri.strip_prefix("gong://calls/");
+            if let Some(id) = call_id {
+                assert!(id.is_empty(), "Should have empty call ID for invalid URI: {}", uri);
+            }
+        }
+    }
+
+    #[test]
+    fn test_result_truncation_logic() {
+        let calls = vec![
+            json!({"id": "1"}),
+            json!({"id": "2"}),
+            json!({"id": "3"}),
+            json!({"id": "4"}),
+            json!({"id": "5"}),
+        ];
+
+        // Test with limit
+        let limit = Some(3);
+        let total = calls.len();
+
+        let (truncated_calls, is_truncated) = if let Some(limit_value) = limit {
+            if calls.len() > limit_value {
+                (calls.into_iter().take(limit_value).collect::<Vec<_>>(), true)
+            } else {
+                (calls, false)
+            }
+        } else {
+            (calls, false)
+        };
+
+        assert_eq!(truncated_calls.len(), 3, "Should have 3 calls after truncation");
+        assert_eq!(total, 5, "Total should be 5 before truncation");
+        assert!(is_truncated, "Should be marked as truncated");
+    }
+
+    #[test]
+    fn test_result_no_truncation_when_under_limit() {
+        let calls = vec![
+            json!({"id": "1"}),
+            json!({"id": "2"}),
+        ];
+
+        // Test with limit higher than actual count
+        let limit = Some(5);
+        let total = calls.len();
+
+        let (truncated_calls, is_truncated) = if let Some(limit_value) = limit {
+            if calls.len() > limit_value {
+                (calls.into_iter().take(limit_value).collect::<Vec<_>>(), true)
+            } else {
+                (calls, false)
+            }
+        } else {
+            (calls, false)
+        };
+
+        assert_eq!(truncated_calls.len(), 2, "Should have all 2 calls");
+        assert_eq!(total, 2, "Total should be 2");
+        assert!(!is_truncated, "Should NOT be marked as truncated when under limit");
+    }
+
+    #[test]
+    fn test_new_parameter_extraction() {
+        let json_args = json!({
+            "from_date_time": "2024-01-01T00:00:00Z",
+            "limit": 10,
+            "include_structure": true
+        });
+
+        let args_map = json_args.as_object();
+
+        // Extract limit
+        let limit = args_map
+            .and_then(|a| a.get("limit"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        assert_eq!(limit, Some(10), "Limit should be 10");
+
+        // Extract include_structure
+        let include_structure = args_map
+            .and_then(|a| a.get("include_structure"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(include_structure, "include_structure should be true");
+    }
+
+    #[test]
+    fn test_include_structure_default_false() {
+        let json_args = json!({
+            "from_date_time": "2024-01-01T00:00:00Z"
+        });
+
+        let args_map = json_args.as_object();
+
+        // Extract include_structure (should default to false)
+        let include_structure = args_map
+            .and_then(|a| a.get("include_structure"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!include_structure, "include_structure should default to false when not provided");
+    }
+
+    #[test]
+    fn test_uri_disambiguation() {
+        // Ensure we can distinguish between call metadata and transcript
+        let metadata_uri = "gong://calls/123456";
+        let transcript_uri = "gong://calls/123456/transcript";
+
+        // Metadata should not end with /transcript
+        assert!(!metadata_uri.ends_with("/transcript"), "Metadata URI should not end with /transcript");
+        assert!(metadata_uri.starts_with("gong://calls/"), "Metadata URI should start with gong://calls/");
+
+        // Transcript should end with /transcript
+        assert!(transcript_uri.ends_with("/transcript"), "Transcript URI should end with /transcript");
+        assert!(transcript_uri.starts_with("gong://calls/"), "Transcript URI should start with gong://calls/");
+
+        // Extract call IDs
+        let metadata_call_id = metadata_uri.strip_prefix("gong://calls/");
+        let transcript_call_id = transcript_uri
+            .strip_prefix("gong://calls/")
+            .and_then(|s| s.strip_suffix("/transcript"));
+
+        assert_eq!(metadata_call_id, Some("123456"), "Metadata URI should extract call ID");
+        assert_eq!(transcript_call_id, Some("123456"), "Transcript URI should extract call ID");
     }
 }
