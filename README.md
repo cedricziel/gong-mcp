@@ -1,12 +1,13 @@
 # Gong MCP Server
 
-A Model Context Protocol (MCP) server that provides access to Gong calls and data via resources.
+A Model Context Protocol (MCP) server that provides access to Gong calls and data via **tools** (for search) and **resources** (for direct access).
 
 ## Features
 
-- **Resource-based access** to Gong API data
-- Exposes Gong calls, users, and other resources
-- Built with the official Rust MCP SDK
+- **Flexible call search** via `search_calls` tool with comprehensive filters
+- **Direct data access** via resources (transcripts, users, status)
+- **Pagination support** with cursor-based navigation
+- Built with the official Rust MCP SDK (rmcp v0.8)
 - Docker container support for easy deployment
 
 ## Prerequisites
@@ -162,13 +163,64 @@ Add to your Cursor settings:
 }
 ```
 
-## Available Resources
+## Available Capabilities
 
-Once configured, the server exposes the following resources:
+Once configured, the server exposes:
+
+### Tools
+
+**`search_calls`** - Flexible call search with optional filters:
+
+- `from_date_time` (string): ISO 8601 start date
+- `to_date_time` (string): ISO 8601 end date
+- `workspace_id` (string): Filter by workspace
+- `call_ids` (array): Specific call IDs
+- `primary_user_ids` (array): Filter by user/host
+- `cursor` (string): Pagination cursor
+
+All parameters are optional. Returns calls with pagination support.
+
+### Resources
+
+**Static:**
 
 - `gong://status` - Configuration status and health check
-- `gong://calls` - List of recent calls from Gong
 - `gong://users` - List of users in your Gong workspace
+
+**Dynamic (templates):**
+
+- `gong://calls/{callId}/transcript` - Get transcript for a specific call
+
+## Usage Examples
+
+### Searching for Calls
+
+Ask Claude to search for calls with natural language:
+
+- "Show me calls from last week"
+- "Find calls where user ID 12345 participated in January"
+- "Get calls from workspace W789"
+
+Claude will use the `search_calls` tool with appropriate parameters:
+
+```json
+{
+  "name": "search_calls",
+  "arguments": {
+    "from_date_time": "2024-01-01T00:00:00Z",
+    "to_date_time": "2024-01-31T23:59:59Z",
+    "primary_user_ids": ["12345"]
+  }
+}
+```
+
+### Accessing Transcripts
+
+Once you have a call ID from search results, ask for the transcript:
+
+- "Show me the transcript for call ABC123"
+
+Claude will access: `gong://calls/ABC123/transcript`
 
 ## Development
 

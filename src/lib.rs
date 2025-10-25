@@ -55,27 +55,32 @@ impl GongServer {
         self.config.is_some()
     }
 
-    /// Fetch list of calls from Gong API
-    async fn _fetch_calls(&self) -> Result<models::Calls, McpError> {
+    /// Fetch list of calls from Gong API with optional filters and cursor for pagination
+    async fn _fetch_calls_with_filter(
+        &self,
+        from_date_time: Option<String>,
+        to_date_time: Option<String>,
+        workspace_id: Option<String>,
+        call_ids: Option<Vec<String>>,
+        primary_user_ids: Option<Vec<String>>,
+        cursor: Option<String>,
+    ) -> Result<models::Calls, McpError> {
         let config = self
             .config
             .as_ref()
             .as_ref()
             .ok_or_else(|| McpError::invalid_request("not_configured", None))?;
 
-        // Fetch calls from the last 7 days
-        let from_date_time = chrono::Utc::now() - chrono::Duration::days(7);
-
         let params = calls_api::ListCallsExtensiveParams {
             public_api_base_request_with_data_v2_calls_request_filter_with_owners_content_selector:
                 models::PublicApiBaseRequestWithDataV2CallsRequestFilterWithOwnersContentSelector {
-                    cursor: None,
+                    cursor,
                     filter: Box::new(models::CallsRequestFilterWithOwners {
-                        from_date_time: Some(from_date_time.to_rfc3339()),
-                        to_date_time: None,
-                        workspace_id: None,
-                        call_ids: None,
-                        primary_user_ids: None,
+                        from_date_time,
+                        to_date_time,
+                        workspace_id,
+                        call_ids,
+                        primary_user_ids,
                     }),
                     content_selector: Some(Box::new(models::ContentSelector {
                         context: None,
@@ -159,6 +164,7 @@ impl ServerHandler for GongServer {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder()
                 .enable_resources()
+                .enable_tools()
                 .build(),
             server_info: Implementation {
                 name: "gong-mcp".to_string(),
@@ -199,11 +205,6 @@ impl ServerHandler for GongServer {
                     "Check if the Gong API is configured correctly",
                 ),
                 self._create_resource(
-                    "gong://calls",
-                    "Gong Calls",
-                    "List of recent calls from Gong",
-                ),
-                self._create_resource(
                     "gong://users",
                     "Gong Users",
                     "List of users in your Gong workspace",
@@ -242,57 +243,6 @@ impl ServerHandler for GongServer {
                 Ok(ReadResourceResult {
                     contents: vec![ResourceContents::text(
                         serde_json::to_string_pretty(&status).unwrap(),
-                        uri,
-                    )],
-                })
-            }
-            "gong://calls" => {
-                if !self._is_configured() {
-                    return Err(McpError::invalid_request(
-                        "not_configured",
-                        Some(json!({
-                            "message": "Gong API is not configured. Please set environment variables."
-                        })),
-                    ));
-                }
-
-                // Fetch calls from Gong API
-                let calls_data = self._fetch_calls().await?;
-
-                // Extract and format the calls for easier consumption
-                let formatted_response = if let Some(calls) = calls_data.calls {
-                    let formatted_calls: Vec<serde_json::Value> = calls
-                        .iter()
-                        .map(|call| {
-                            let meta = call.meta_data.as_ref().map(|m| m.as_ref());
-                            json!({
-                                "id": meta.and_then(|m| m.id.as_ref()).unwrap_or(&String::new()),
-                                "title": meta.and_then(|m| m.title.as_ref()).unwrap_or(&"Untitled".to_string()),
-                                "started": meta.and_then(|m| m.started.as_ref()).unwrap_or(&String::new()),
-                                "duration": meta.and_then(|m| m.duration).unwrap_or(0),
-                                "direction": meta.and_then(|m| m.direction.as_ref()).map(|d| format!("{:?}", d)).unwrap_or_default(),
-                                "parties": call.parties.as_ref().map(|p| json!(p)).unwrap_or(json!([])),
-                                "url": meta.and_then(|m| m.url.as_ref()).unwrap_or(&String::new()),
-                            })
-                        })
-                        .collect();
-
-                    json!({
-                        "calls": formatted_calls,
-                        "count": formatted_calls.len(),
-                        "message": format!("Retrieved {} calls from the last 7 days", formatted_calls.len())
-                    })
-                } else {
-                    json!({
-                        "calls": [],
-                        "count": 0,
-                        "message": "No calls found"
-                    })
-                };
-
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(
-                        serde_json::to_string_pretty(&formatted_response).unwrap(),
                         uri,
                     )],
                 })
@@ -521,6 +471,204 @@ impl ServerHandler for GongServer {
             resource_templates: templates,
         })
     }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        if !self._is_configured() {
+            return Ok(ListToolsResult {
+                next_cursor: None,
+                tools: Vec::new(),
+            });
+        }
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "from_date_time": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Start of time range in ISO 8601 format (e.g., '2024-01-01T00:00:00Z' or '2024-01-01T02:30:00-07:00'). Returns calls that started on or after this time."
+                },
+                "to_date_time": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "End of time range in ISO 8601 format. Returns calls that started before this time (exclusive)."
+                },
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Filter by workspace ID. Returns only calls belonging to this workspace."
+                },
+                "call_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of specific call IDs to retrieve. If provided, only these calls are returned (within date range if specified)."
+                },
+                "primary_user_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Filter by user IDs. Returns calls where these users are the primary participant/host."
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Pagination cursor from a previous response. Use this to get the next page of results."
+                }
+            },
+            "additionalProperties": false
+        });
+
+        let schema_obj = schema.as_object().unwrap().clone();
+
+        let tools = vec![Tool::new(
+            "search_calls",
+            "Search Gong calls with flexible filters including date range, workspace, users, and call IDs. \
+             Supports pagination for large result sets. All parameters are optional - if no filters are provided, \
+             returns calls from the entire available history.",
+            std::sync::Arc::new(schema_obj),
+        )
+        .annotate(ToolAnnotations::new().read_only(true))];
+
+        Ok(ListToolsResult {
+            next_cursor: None,
+            tools,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        CallToolRequestParam { name, arguments }: CallToolRequestParam,
+        _: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match name.as_ref() {
+            "search_calls" => {
+                if !self._is_configured() {
+                    return Err(McpError::invalid_request(
+                        "not_configured",
+                        Some(json!({
+                            "message": "Gong API is not configured. Please set GONG_BASE_URL, GONG_ACCESS_KEY, and GONG_ACCESS_KEY_SECRET environment variables.",
+                            "required_env_vars": ["GONG_BASE_URL", "GONG_ACCESS_KEY", "GONG_ACCESS_KEY_SECRET"]
+                        })),
+                    ));
+                }
+
+                // Get arguments or use empty map if None
+                let args = arguments.as_ref();
+
+                // Extract parameters from arguments
+                let from_date_time = args
+                    .and_then(|a| a.get("from_date_time"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let to_date_time = args
+                    .and_then(|a| a.get("to_date_time"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let workspace_id = args
+                    .and_then(|a| a.get("workspace_id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let call_ids = args
+                    .and_then(|a| a.get("call_ids"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<String>>()
+                    });
+
+                let primary_user_ids = args
+                    .and_then(|a| a.get("primary_user_ids"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<String>>()
+                    });
+
+                let cursor = args
+                    .and_then(|a| a.get("cursor"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                // Fetch calls from Gong API
+                let calls_data = self
+                    ._fetch_calls_with_filter(
+                        from_date_time.clone(),
+                        to_date_time.clone(),
+                        workspace_id.clone(),
+                        call_ids.clone(),
+                        primary_user_ids.clone(),
+                        cursor.clone(),
+                    )
+                    .await?;
+
+                // Extract and format the calls for easier consumption
+                let formatted_response = if let Some(calls) = calls_data.calls {
+                    let formatted_calls: Vec<serde_json::Value> = calls
+                        .iter()
+                        .map(|call| {
+                            let meta = call.meta_data.as_ref().map(|m| m.as_ref());
+                            json!({
+                                "id": meta.and_then(|m| m.id.as_ref()).unwrap_or(&String::new()),
+                                "title": meta.and_then(|m| m.title.as_ref()).unwrap_or(&"Untitled".to_string()),
+                                "started": meta.and_then(|m| m.started.as_ref()).unwrap_or(&String::new()),
+                                "duration": meta.and_then(|m| m.duration).unwrap_or(0),
+                                "direction": meta.and_then(|m| m.direction.as_ref()).map(|d| format!("{:?}", d)).unwrap_or_default(),
+                                "parties": call.parties.as_ref().map(|p| json!(p)).unwrap_or(json!([])),
+                                "url": meta.and_then(|m| m.url.as_ref()).unwrap_or(&String::new()),
+                            })
+                        })
+                        .collect();
+
+                    json!({
+                        "calls": formatted_calls,
+                        "count": formatted_calls.len(),
+                        "nextCursor": calls_data.records.as_ref().and_then(|r| r.cursor.clone()),
+                        "hasMore": calls_data.records.as_ref().and_then(|r| r.cursor.as_ref()).is_some(),
+                        "filters": {
+                            "from_date_time": from_date_time,
+                            "to_date_time": to_date_time,
+                            "workspace_id": workspace_id,
+                            "call_ids": call_ids,
+                            "primary_user_ids": primary_user_ids,
+                        }
+                    })
+                } else {
+                    json!({
+                        "calls": [],
+                        "count": 0,
+                        "nextCursor": null,
+                        "hasMore": false,
+                        "filters": {
+                            "from_date_time": from_date_time,
+                            "to_date_time": to_date_time,
+                            "workspace_id": workspace_id,
+                            "call_ids": call_ids,
+                            "primary_user_ids": primary_user_ids,
+                        }
+                    })
+                };
+
+                Ok(CallToolResult {
+                    content: vec![Content::text(
+                        serde_json::to_string_pretty(&formatted_response).unwrap(),
+                    )],
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                })
+            }
+            _ => Err(McpError::invalid_params(
+                "unknown_tool",
+                Some(json!({"tool": name})),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -616,5 +764,44 @@ mod tests {
             std::env::remove_var("GONG_ACCESS_KEY");
             std::env::remove_var("GONG_ACCESS_KEY_SECRET");
         }
+    }
+
+    #[test]
+    fn test_server_capabilities_include_tools() {
+        let server = GongServer::new();
+        let info = server.get_info();
+        assert!(info.capabilities.tools.is_some(), "Server should support tools");
+        assert!(info.capabilities.resources.is_some(), "Server should support resources");
+    }
+
+    #[test]
+    fn test_parameter_extraction_from_json() {
+        // Test parameter extraction logic
+        let json_args = json!({
+            "from_date_time": "2024-01-01T00:00:00Z",
+            "to_date_time": "2024-01-31T23:59:59Z",
+            "workspace_id": "W123",
+            "call_ids": ["call1", "call2"],
+            "primary_user_ids": ["user1", "user2"]
+        });
+
+        let args_map = json_args.as_object();
+
+        // Extract from_date_time
+        let from_date = args_map
+            .and_then(|a| a.get("from_date_time"))
+            .and_then(|v| v.as_str());
+        assert_eq!(from_date, Some("2024-01-01T00:00:00Z"));
+
+        // Extract call_ids array
+        let call_ids = args_map
+            .and_then(|a| a.get("call_ids"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<String>>()
+            });
+        assert_eq!(call_ids, Some(vec!["call1".to_string(), "call2".to_string()]));
     }
 }
