@@ -32,6 +32,13 @@ COPY --from=builder /app/target/release/gong-mcp /usr/local/bin/gong-mcp
 ENV GONG_BASE_URL=""
 ENV GONG_ACCESS_KEY=""
 ENV GONG_ACCESS_KEY_SECRET=""
+ENV DOCKER_ENV="1"
+
+# Expose HTTP port (only used in HTTP mode)
+EXPOSE 8080
 
 # Run the application
+# Default to stdio mode for backward compatibility
+# Override with: docker run ... gong-mcp --mode http --host 0.0.0.0 --port 8080
 ENTRYPOINT ["/usr/local/bin/gong-mcp"]
+CMD []

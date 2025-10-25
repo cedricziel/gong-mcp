@@ -33,7 +33,7 @@ cargo test
 cargo test -- --nocapture  # Show println! output
 ```
 
-**Run locally:**
+**Run locally (stdio mode - default):**
 
 ```bash
 # Requires environment variables
@@ -41,6 +41,21 @@ GONG_BASE_URL="https://api.gong.io" \
 GONG_ACCESS_KEY="your-access-key" \
 GONG_ACCESS_KEY_SECRET="your-secret" \
 cargo run
+```
+
+**Run locally (HTTP mode):**
+
+```bash
+GONG_BASE_URL="https://api.gong.io" \
+GONG_ACCESS_KEY="your-access-key" \
+GONG_ACCESS_KEY_SECRET="your-secret" \
+cargo run -- --mode http --host 127.0.0.1 --port 8080
+```
+
+**Get CLI help:**
+
+```bash
+cargo run -- --help
 ```
 
 **Linting:**
@@ -56,12 +71,21 @@ cargo fmt --check
 # Build
 docker build -t gong-mcp .
 
-# Run
-docker run -it \
+# Run (stdio mode)
+docker run -i --rm \
   -e GONG_BASE_URL="https://api.gong.io" \
   -e GONG_ACCESS_KEY="your-key" \
   -e GONG_ACCESS_KEY_SECRET="your-secret" \
   gong-mcp
+
+# Run (HTTP mode)
+docker run -d \
+  -p 8080:8080 \
+  -e GONG_BASE_URL="https://api.gong.io" \
+  -e GONG_ACCESS_KEY="your-key" \
+  -e GONG_ACCESS_KEY_SECRET="your-secret" \
+  gong-mcp \
+  --mode http --host 0.0.0.0 --port 8080
 ```
 
 ## MCP Architecture
@@ -146,16 +170,94 @@ gong://calls/{callId}/transcript
 
 URI parsing in `read_resource()` uses pattern matching with `strip_prefix()`/`strip_suffix()` for parameter extraction.
 
+## Transport Configuration
+
+The server supports two transport modes: **stdio** (default) and **Streamable HTTP**.
+
+### stdio Transport (Default)
+
+**Use Cases:**
+- Claude Desktop integration
+- Local development and testing
+- Process-based MCP clients
+- Docker containers with stdin/stdout communication
+
+**Characteristics:**
+- Uses standard input/output streams
+- Simple, low-overhead communication
+- Synchronous request/response pattern
+- No network ports required
+
+**Running:**
+```bash
+# Default mode
+cargo run
+
+# Explicit stdio mode
+cargo run -- --mode stdio
+```
+
+### Streamable HTTP Transport
+
+**Use Cases:**
+- Web-based clients
+- Remote access scenarios
+- Cloud deployments
+- HTTP-based integrations
+
+**Characteristics:**
+- MCP spec-compliant (2025-03-26)
+- HTTP-based communication with bidirectional streaming
+- Supports remote connections
+- Single endpoint (simpler than deprecated SSE dual-endpoint pattern)
+- Native HTTP/2 and HTTP/3 support
+- Better connection resilience and recovery
+
+**CLI Options:**
+- `--mode http` - Enable Streamable HTTP transport
+- `--host <address>` - Bind address (default: 127.0.0.1, or 0.0.0.0 in Docker)
+- `--port <port>` - Port number (default: 8080)
+
+**Endpoint:**
+- `http://<host>:<port>/mcp` - Streamable HTTP endpoint
+
+**Running:**
+```bash
+# Local development
+cargo run -- --mode http --host 127.0.0.1 --port 8080
+
+# Remote access
+cargo run -- --mode http --host 0.0.0.0 --port 8080
+```
+
+**Docker Auto-Detection:**
+The server automatically detects Docker environment and defaults to `0.0.0.0` binding when:
+- `DOCKER_ENV` environment variable is set, OR
+- `/.dockerenv` file exists, OR
+- `/proc/1/cgroup` contains "docker"
+
+**Implementation Details (src/main.rs):**
+- CLI parsing via `clap` with derive macros
+- Uses `transport-streamable-http-server` feature from rmcp 0.8
+- `StreamableHttpService::new()` with service factory pattern
+- `LocalSessionManager` for session handling
+- Axum router nesting service under `/mcp` path
+- Graceful shutdown via `tokio::signal::ctrl_c()`
+- Single HTTP server (no dual endpoint complexity)
+
 ## Core Architecture
 
 ### Entry Point (src/main.rs)
 
-Simple async main that:
+Async main with CLI-based transport selection:
 
-1. Initializes tracing to stderr (required for stdio transport)
-2. Creates `GongServer` instance
-3. Serves using stdio transport
-4. Waits for service completion
+1. Initializes tracing to stderr
+2. Parses CLI arguments (mode, host, port)
+3. Creates `GongServer` instance
+4. Conditionally serves using either:
+   - **stdio transport**: Simple stdin/stdout communication
+   - **HTTP transport**: Streamable HTTP with axum router nesting the MCP service, graceful shutdown support
+5. Waits for service completion
 
 ### Server Implementation (src/lib.rs)
 
@@ -362,14 +464,40 @@ All MCP handler methods are async. Use `.await` for API calls.
 
 ## Docker Deployment
 
-**Transport:** Stdio only (not SSE) - appropriate for Docker deployment where server runs as a subprocess.
+**Supported Transports:** Both stdio and Streamable HTTP modes are supported.
+
+**Default behavior:**
+- Defaults to stdio mode for backward compatibility
+- Auto-detects Docker environment for HTTP host binding (uses 0.0.0.0)
+- Port 8080 is exposed for HTTP mode
 
 **Container behavior:**
 
-- Expects environment variables at runtime
+- Expects environment variables at runtime (GONG_BASE_URL, GONG_ACCESS_KEY, GONG_ACCESS_KEY_SECRET)
+- `DOCKER_ENV=1` is set to enable auto-detection
 - Logs to stderr (captured by Docker)
 - Runs as PID 1 in container
 - Handles signals for graceful shutdown
+
+**Running modes:**
+
+```bash
+# Stdio mode (default, for Claude Desktop)
+docker run -i --rm \
+  -e GONG_BASE_URL="..." \
+  -e GONG_ACCESS_KEY="..." \
+  -e GONG_ACCESS_KEY_SECRET="..." \
+  gong-mcp
+
+# HTTP mode (for web clients)
+docker run -d \
+  -p 8080:8080 \
+  -e GONG_BASE_URL="..." \
+  -e GONG_ACCESS_KEY="..." \
+  -e GONG_ACCESS_KEY_SECRET="..." \
+  gong-mcp \
+  --mode http --host 0.0.0.0 --port 8080
+```
 
 ## Logging and Debugging
 
@@ -421,7 +549,7 @@ RUST_LOG=gong_mcp=trace cargo run
 
 ## MCP Specification Compliance
 
-**Protocol Version:** V_2024_11_05
+**Protocol Version:** Compliant with MCP spec 2025-03-26
 
 **Capabilities Implemented:**
 
@@ -429,6 +557,7 @@ RUST_LOG=gong_mcp=trace cargo run
 - ✓ Resource templates (dynamic) - Call transcripts
 - ✓ Tools - Flexible call search with parameters
 - ✓ Stdio transport
+- ✓ Streamable HTTP transport (spec-compliant, replaces deprecated SSE)
 - ✓ Proper error handling
 - ✓ Pagination support (cursor-based)
 
@@ -436,7 +565,6 @@ RUST_LOG=gong_mcp=trace cargo run
 
 - Prompts - Not needed for this use case
 - Subscriptions - Future enhancement
-- SSE transport - Not needed for local/Docker deployment
 
 ## Troubleshooting
 

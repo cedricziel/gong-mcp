@@ -7,6 +7,7 @@ A Model Context Protocol (MCP) server that provides access to Gong calls and dat
 - **Flexible call search** via `search_calls` tool with comprehensive filters
 - **Direct data access** via resources (transcripts, users, status)
 - **Pagination support** with cursor-based navigation
+- **Dual transport modes**: stdio (default) and Streamable HTTP for web-based clients
 - Built with the official Rust MCP SDK (rmcp v0.8)
 - Docker container support for easy deployment
 
@@ -23,6 +24,50 @@ The server requires the following environment variables:
 - `GONG_ACCESS_KEY`: Your Gong API access key
 - `GONG_ACCESS_KEY_SECRET`: Your Gong API access key secret
 
+## Transport Modes
+
+The server supports two transport modes:
+
+### stdio (Default)
+
+Stdio transport uses standard input/output for communication. This is the default mode and is suitable for:
+
+- Claude Desktop integration
+- Local CLI usage
+- Process-based MCP clients
+
+### HTTP (Streamable HTTP)
+
+Streamable HTTP transport provides spec-compliant HTTP-based communication for web clients. Use this mode for:
+
+- Web-based applications
+- Remote access scenarios
+- Cloud deployments
+- Modern HTTP/2 and HTTP/3 support
+
+**CLI Options:**
+
+- `--mode <stdio|http>` - Select transport mode (default: stdio)
+- `--host <address>` - Host to bind to in HTTP mode (default: 127.0.0.1, or 0.0.0.0 in Docker)
+- `--port <port>` - Port to bind to in HTTP mode (default: 8080)
+
+**Examples:**
+
+```bash
+# Stdio mode (default)
+gong-mcp
+
+# HTTP mode on localhost
+gong-mcp --mode http --host 127.0.0.1 --port 8080
+
+# HTTP mode for remote access
+gong-mcp --mode http --host 0.0.0.0 --port 8080
+```
+
+**HTTP Endpoint:**
+
+- `http://<host>:<port>/mcp` - Streamable HTTP endpoint (MCP spec 2025-03-26)
+
 ## Installation
 
 ### Using Docker (Recommended)
@@ -35,22 +80,54 @@ docker pull ghcr.io/cedricziel/gong-mcp:latest
 
 Run the container:
 
+**Stdio mode (for Claude Desktop, default):**
+
 ```bash
-docker run -it \
+docker run -i --rm \
   -e GONG_BASE_URL="https://api.gong.io" \
   -e GONG_ACCESS_KEY="your-access-key" \
   -e GONG_ACCESS_KEY_SECRET="your-secret" \
   ghcr.io/cedricziel/gong-mcp:latest
 ```
 
+**HTTP mode (for web clients):**
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -e GONG_BASE_URL="https://api.gong.io" \
+  -e GONG_ACCESS_KEY="your-access-key" \
+  -e GONG_ACCESS_KEY_SECRET="your-secret" \
+  ghcr.io/cedricziel/gong-mcp:latest \
+  --mode http --host 0.0.0.0 --port 8080
+```
+
+Then connect to `http://localhost:8080/mcp` from your web client.
+
 ### From Source
+
+**Build:**
 
 ```bash
 cargo build --release
+```
+
+**Run in stdio mode:**
+
+```bash
 GONG_BASE_URL="https://api.gong.io" \
 GONG_ACCESS_KEY="your-access-key" \
 GONG_ACCESS_KEY_SECRET="your-secret" \
 ./target/release/gong-mcp
+```
+
+**Run in HTTP mode:**
+
+```bash
+GONG_BASE_URL="https://api.gong.io" \
+GONG_ACCESS_KEY="your-access-key" \
+GONG_ACCESS_KEY_SECRET="your-secret" \
+./target/release/gong-mcp --mode http --host 127.0.0.1 --port 8080
 ```
 
 ## Using with Claude Desktop
@@ -238,11 +315,28 @@ cargo test
 
 ### Running locally
 
+**Stdio mode (default):**
+
 ```bash
 GONG_BASE_URL="https://api.gong.io" \
 GONG_ACCESS_KEY="your-access-key" \
 GONG_ACCESS_KEY_SECRET="your-secret" \
 cargo run
+```
+
+**HTTP mode:**
+
+```bash
+GONG_BASE_URL="https://api.gong.io" \
+GONG_ACCESS_KEY="your-access-key" \
+GONG_ACCESS_KEY_SECRET="your-secret" \
+cargo run -- --mode http --host 127.0.0.1 --port 8080
+```
+
+**Get help:**
+
+```bash
+cargo run -- --help
 ```
 
 ## Dependencies
