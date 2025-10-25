@@ -64,6 +64,7 @@ impl GongServer {
         call_ids: Option<Vec<String>>,
         primary_user_ids: Option<Vec<String>>,
         cursor: Option<String>,
+        include_structure: bool,
     ) -> Result<models::Calls, McpError> {
         let config = self
             .config
@@ -87,18 +88,22 @@ impl GongServer {
                         context_timing: None,
                         exposed_fields: Some(Box::new(models::ExposedFields {
                             collaboration: None,
-                            content: Some(Box::new(models::CallContent {
-                                structure: Some(true),
-                                topics: None,
-                                trackers: None,
-                                tracker_occurrences: None,
-                                points_of_interest: None,
-                                brief: None,
-                                outline: None,
-                                highlights: None,
-                                call_outcome: None,
-                                key_points: None,
-                            })),
+                            content: if include_structure {
+                                Some(Box::new(models::CallContent {
+                                    structure: Some(true),
+                                    topics: None,
+                                    trackers: None,
+                                    tracker_occurrences: None,
+                                    points_of_interest: None,
+                                    brief: None,
+                                    outline: None,
+                                    highlights: None,
+                                    call_outcome: None,
+                                    key_points: None,
+                                }))
+                            } else {
+                                None
+                            },
                             parties: Some(true),
                             interaction: None,
                             media: None,
@@ -514,6 +519,14 @@ impl ServerHandler for GongServer {
                 "cursor": {
                     "type": "string",
                     "description": "Pagination cursor from a previous response. Use this to get the next page of results."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of calls to return from the current page. Without this, returns all calls from the API page (typically 100). Response includes 'truncated: true' if limited. Use this to reduce response size."
+                },
+                "include_structure": {
+                    "type": "boolean",
+                    "description": "Include call agenda/structure data (segments and their durations). Default: false. Basic call metadata (id, title, started, duration, direction, parties, url) is always included. Increases response size moderately."
                 }
             },
             "additionalProperties": false
@@ -523,9 +536,10 @@ impl ServerHandler for GongServer {
 
         let tools = vec![Tool::new(
             "search_calls",
-            "Search Gong calls with flexible filters including date range, workspace, users, and call IDs. \
-             Supports pagination for large result sets. All parameters are optional - if no filters are provided, \
-             returns calls from the entire available history.",
+            "Search Gong calls with flexible filters. Returns basic call metadata (id, title, started, duration, \
+             direction, parties, url) by default. Use include_structure to add call agenda data. \
+             Supports pagination for large result sets - use limit to reduce response size. \
+             All parameters are optional - returns recent calls if no filters provided.",
             std::sync::Arc::new(schema_obj),
         )
         .annotate(ToolAnnotations::new().read_only(true))];
@@ -595,6 +609,16 @@ impl ServerHandler for GongServer {
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
+                let limit = args
+                    .and_then(|a| a.get("limit"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+
+                let include_structure = args
+                    .and_then(|a| a.get("include_structure"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
                 // Fetch calls from Gong API
                 let calls_data = self
                     ._fetch_calls_with_filter(
@@ -604,12 +628,21 @@ impl ServerHandler for GongServer {
                         call_ids.clone(),
                         primary_user_ids.clone(),
                         cursor.clone(),
+                        include_structure,
                     )
                     .await?;
 
                 // Extract and format the calls for easier consumption
+                // Response format:
+                // - calls: Array of call objects with basic metadata
+                // - count: Number of calls returned (after limit applied)
+                // - totalAvailable: Total calls in current API page before limiting (typically 100)
+                // - truncated: true if limit parameter was applied and reduced the result set
+                // - hasMore: true if more pages available (use nextCursor to fetch)
+                // - nextCursor: Pagination cursor for retrieving the next page
+                // - filters: Echo of all filter parameters used in the request
                 let formatted_response = if let Some(calls) = calls_data.calls {
-                    let formatted_calls: Vec<serde_json::Value> = calls
+                    let all_formatted_calls: Vec<serde_json::Value> = calls
                         .iter()
                         .map(|call| {
                             let meta = call.meta_data.as_ref().map(|m| m.as_ref());
@@ -625,9 +658,22 @@ impl ServerHandler for GongServer {
                         })
                         .collect();
 
+                    let total_available = all_formatted_calls.len();
+                    let (formatted_calls, truncated) = if let Some(limit_value) = limit {
+                        if all_formatted_calls.len() > limit_value {
+                            (all_formatted_calls.into_iter().take(limit_value).collect(), true)
+                        } else {
+                            (all_formatted_calls, false)
+                        }
+                    } else {
+                        (all_formatted_calls, false)
+                    };
+
                     json!({
                         "calls": formatted_calls,
                         "count": formatted_calls.len(),
+                        "totalAvailable": total_available,
+                        "truncated": truncated,
                         "nextCursor": calls_data.records.as_ref().and_then(|r| r.cursor.clone()),
                         "hasMore": calls_data.records.as_ref().and_then(|r| r.cursor.as_ref()).is_some(),
                         "filters": {
@@ -636,12 +682,16 @@ impl ServerHandler for GongServer {
                             "workspace_id": workspace_id,
                             "call_ids": call_ids,
                             "primary_user_ids": primary_user_ids,
+                            "limit": limit,
+                            "include_structure": include_structure,
                         }
                     })
                 } else {
                     json!({
                         "calls": [],
                         "count": 0,
+                        "totalAvailable": 0,
+                        "truncated": false,
                         "nextCursor": null,
                         "hasMore": false,
                         "filters": {
@@ -650,6 +700,8 @@ impl ServerHandler for GongServer {
                             "workspace_id": workspace_id,
                             "call_ids": call_ids,
                             "primary_user_ids": primary_user_ids,
+                            "limit": limit,
+                            "include_structure": include_structure,
                         }
                     })
                 };
