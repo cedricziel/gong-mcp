@@ -341,8 +341,153 @@ impl ServerHandler for GongServer {
                 })
             }
             _ => {
-                // Check if it matches the transcript pattern: gong://calls/{callId}/transcript
-                if uri.starts_with("gong://calls/") && uri.ends_with("/transcript") {
+                // Check if it matches the participants pattern: gong://calls/{callId}/participants
+                if uri.starts_with("gong://calls/") && uri.ends_with("/participants") {
+                    if !self._is_configured() {
+                        return Err(McpError::invalid_request(
+                            "not_configured",
+                            Some(json!({
+                                "message": "Gong API is not configured. Please set environment variables."
+                            })),
+                        ));
+                    }
+
+                    // Extract call ID from URI
+                    let call_id = uri
+                        .strip_prefix("gong://calls/")
+                        .and_then(|s| s.strip_suffix("/participants"))
+                        .ok_or_else(|| {
+                            McpError::invalid_params(
+                                "invalid_uri",
+                                Some(json!({
+                                    "message": "Invalid URI format. Expected: gong://calls/{callId}/participants",
+                                    "uri": uri
+                                })),
+                            )
+                        })?;
+
+                    // Validate call ID is not empty
+                    if call_id.is_empty() {
+                        return Err(McpError::invalid_params(
+                            "missing_call_id",
+                            Some(json!({
+                                "message": "Call ID cannot be empty"
+                            })),
+                        ));
+                    }
+
+                    // Fetch call data from Gong API using list_calls_extensive
+                    // (get_call returns CallBasicData which doesn't include parties)
+                    let calls_data = self._fetch_calls_with_filter(
+                        None,
+                        None,
+                        None,
+                        Some(vec![call_id.to_string()]),
+                        None,
+                        None,
+                        false, // Don't need structure for participants
+                    ).await?;
+
+                    // Format the participants response
+                    let formatted_response = if let Some(calls) = calls_data.calls {
+                        if let Some(call) = calls.first() {
+                            // Extract and transform participants
+                            let participants = call.parties.as_ref().map(|parties| {
+                                parties.iter().map(|party| {
+                                    json!({
+                                        "id": party.id,
+                                        "name": party.name,
+                                        "emailAddress": party.email_address,
+                                        "title": party.title,
+                                        "affiliation": party.affiliation.as_ref().map(|a| format!("{:?}", a)),
+                                        "speakerId": party.speaker_id,
+                                        "userId": party.user_id,
+                                        "phoneNumber": party.phone_number,
+                                        "methods": party.methods.as_ref().map(|m| {
+                                            m.iter().map(|method| format!("{:?}", method)).collect::<Vec<_>>()
+                                        }),
+                                        "context": party.context.as_ref().map(|ctx| {
+                                            ctx.iter().map(|c| {
+                                                json!({
+                                                    "system": c.system.as_ref().map(|s| format!("{:?}", s)),
+                                                    "objects": c.objects
+                                                })
+                                            }).collect::<Vec<_>>()
+                                        }),
+                                    })
+                                }).collect::<Vec<_>>()
+                            }).unwrap_or_default();
+
+                            // Calculate summary statistics
+                            let summary = call.parties.as_ref().map(|parties| {
+                                let internal_count = parties.iter().filter(|p| {
+                                    matches!(p.affiliation, Some(ref a) if format!("{:?}", a) == "Internal")
+                                }).count();
+                                let external_count = parties.iter().filter(|p| {
+                                    matches!(p.affiliation, Some(ref a) if format!("{:?}", a) == "External")
+                                }).count();
+                                let speakers_count = parties.iter().filter(|p| p.speaker_id.is_some()).count();
+                                json!({
+                                    "total": parties.len(),
+                                    "internal": internal_count,
+                                    "external": external_count,
+                                    "speakers": speakers_count,
+                                })
+                            }).unwrap_or(json!({"total": 0, "internal": 0, "external": 0, "speakers": 0}));
+
+                            // Create speaker-to-name mapping table
+                            let speaker_map = call.parties.as_ref().map(|parties| {
+                                parties.iter()
+                                    .filter_map(|party| {
+                                        party.speaker_id.as_ref().map(|speaker_id| {
+                                            let name = party.name.as_ref().map(|n| n.as_str()).unwrap_or("Unknown");
+                                            let affiliation = party.affiliation.as_ref()
+                                                .map(|a| format!("{:?}", a))
+                                                .unwrap_or_else(|| "Unknown".to_string());
+                                            (speaker_id.clone(), format!("{} ({})", name, affiliation))
+                                        })
+                                    })
+                                    .collect::<std::collections::HashMap<_, _>>()
+                            }).unwrap_or_default();
+
+                            let call_id_value = call.meta_data.as_ref()
+                                .and_then(|m| m.as_ref().id.as_ref())
+                                .cloned()
+                                .unwrap_or_else(|| call_id.to_string());
+
+                            json!({
+                                "callId": call_id_value,
+                                "participants": participants,
+                                "summary": summary,
+                                "speakerMap": speaker_map,
+                            })
+                        } else {
+                            return Err(McpError::resource_not_found(
+                                "call_not_found",
+                                Some(json!({
+                                    "callId": call_id,
+                                    "message": "Call not found in API response"
+                                })),
+                            ));
+                        }
+                    } else {
+                        return Err(McpError::resource_not_found(
+                            "call_not_found",
+                            Some(json!({
+                                "callId": call_id,
+                                "message": "No call data returned from API"
+                            })),
+                        ));
+                    };
+
+                    Ok(ReadResourceResult {
+                        contents: vec![ResourceContents::text(
+                            serde_json::to_string_pretty(&formatted_response).unwrap(),
+                            uri,
+                        )],
+                    })
+                } else if uri.starts_with("gong://calls/") && uri.ends_with("/transcript") {
+                    // Check if it matches the transcript pattern: gong://calls/{callId}/transcript
                     if !self._is_configured() {
                         return Err(McpError::invalid_request(
                             "not_configured",
@@ -492,34 +637,71 @@ impl ServerHandler for GongServer {
                         ));
                     }
 
-                    // Fetch call metadata from Gong API
-                    let call_data = self._fetch_call(call_id).await?;
+                    // Fetch call metadata from Gong API using list_calls_extensive
+                    // (get_call returns CallBasicData which doesn't include parties)
+                    let calls_data = self._fetch_calls_with_filter(
+                        None,
+                        None,
+                        None,
+                        Some(vec![call_id.to_string()]),
+                        None,
+                        None,
+                        false, // Don't need structure for metadata
+                    ).await?;
 
                     // Format the call metadata response
-                    let formatted_response = if let Some(call) = call_data.call {
-                        let call = call.as_ref();
-                        json!({
-                            "id": call.id,
-                            "url": call.url,
-                            "title": call.title,
-                            "scheduled": call.scheduled,
-                            "started": call.started,
-                            "duration": call.duration,
-                            "direction": call.direction.as_ref().map(|d| format!("{:?}", d)),
-                            "primaryUserId": call.primary_user_id,
-                            "system": call.system,
-                            "scope": call.scope.as_ref().map(|s| format!("{:?}", s)),
-                            "media": call.media.as_ref().map(|m| format!("{:?}", m)),
-                            "language": call.language,
-                            "workspaceId": call.workspace_id,
-                            "sdrDisposition": call.sdr_disposition,
-                            "clientUniqueId": call.client_unique_id,
-                            "customData": call.custom_data,
-                            "purpose": call.purpose,
-                            "meetingUrl": call.meeting_url,
-                            "isPrivate": call.is_private,
-                            "calendarEventId": call.calendar_event_id,
-                        })
+                    let formatted_response = if let Some(calls) = calls_data.calls {
+                        if let Some(call) = calls.first() {
+                            let meta = call.meta_data.as_ref().map(|m| m.as_ref());
+
+                            // Calculate participant summary
+                            let participant_summary = call.parties.as_ref().map(|parties| {
+                                let internal_count = parties.iter().filter(|p| {
+                                    matches!(p.affiliation, Some(ref a) if format!("{:?}", a) == "Internal")
+                                }).count();
+                                let external_count = parties.iter().filter(|p| {
+                                    matches!(p.affiliation, Some(ref a) if format!("{:?}", a) == "External")
+                                }).count();
+                                json!({
+                                    "total": parties.len(),
+                                    "internal": internal_count,
+                                    "external": external_count,
+                                })
+                            }).unwrap_or(json!({"total": 0, "internal": 0, "external": 0}));
+
+                            json!({
+                                "id": meta.and_then(|m| m.id.as_ref()),
+                                "url": meta.and_then(|m| m.url.as_ref()),
+                                "title": meta.and_then(|m| m.title.as_ref()),
+                                "scheduled": meta.and_then(|m| m.scheduled.as_ref()),
+                                "started": meta.and_then(|m| m.started.as_ref()),
+                                "duration": meta.and_then(|m| m.duration),
+                                "direction": meta.and_then(|m| m.direction.as_ref()).map(|d| format!("{:?}", d)),
+                                "primaryUserId": meta.and_then(|m| m.primary_user_id.as_ref()),
+                                "system": meta.and_then(|m| m.system.as_ref()),
+                                "scope": meta.and_then(|m| m.scope.as_ref()).map(|s| format!("{:?}", s)),
+                                "media": meta.and_then(|m| m.media.as_ref()).map(|m| format!("{:?}", m)),
+                                "language": meta.and_then(|m| m.language.as_ref()),
+                                "workspaceId": meta.and_then(|m| m.workspace_id.as_ref()),
+                                "sdrDisposition": meta.and_then(|m| m.sdr_disposition.as_ref()),
+                                "clientUniqueId": meta.and_then(|m| m.client_unique_id.as_ref()),
+                                "customData": meta.and_then(|m| m.custom_data.as_ref()),
+                                "purpose": meta.and_then(|m| m.purpose.as_ref()),
+                                "meetingUrl": meta.and_then(|m| m.meeting_url.as_ref()),
+                                "isPrivate": meta.and_then(|m| m.is_private),
+                                "calendarEventId": meta.and_then(|m| m.calendar_event_id.as_ref()),
+                                "participantCount": call.parties.as_ref().map(|p| p.len()).unwrap_or(0),
+                                "participantSummary": participant_summary,
+                            })
+                        } else {
+                            return Err(McpError::resource_not_found(
+                                "call_not_found",
+                                Some(json!({
+                                    "callId": call_id,
+                                    "message": "Call not found in API response"
+                                })),
+                            ));
+                        }
                     } else {
                         return Err(McpError::resource_not_found(
                             "call_not_found",
@@ -568,6 +750,16 @@ impl ServerHandler for GongServer {
                 title: None,
                 description: Some(
                     "Retrieve full metadata for a specific Gong call by ID".to_string(),
+                ),
+                mime_type: Some("application/json".to_string()),
+            }
+            .no_annotation(),
+            RawResourceTemplate {
+                uri_template: "gong://calls/{callId}/participants".to_string(),
+                name: "Call Participants".to_string(),
+                title: None,
+                description: Some(
+                    "Retrieve detailed participant information for a specific call, including speaker mapping, affiliation, and external system links".to_string(),
                 ),
                 mime_type: Some("application/json".to_string()),
             }
@@ -759,13 +951,45 @@ impl ServerHandler for GongServer {
                         .iter()
                         .map(|call| {
                             let meta = call.meta_data.as_ref().map(|m| m.as_ref());
+
+                            // Transform participants to LLM-friendly format with key fields
+                            let participants = call.parties.as_ref().map(|parties| {
+                                parties.iter().map(|party| {
+                                    json!({
+                                        "id": party.id,
+                                        "name": party.name,
+                                        "emailAddress": party.email_address,
+                                        "title": party.title,
+                                        "affiliation": party.affiliation.as_ref().map(|a| format!("{:?}", a)),
+                                        "speakerId": party.speaker_id,
+                                        "userId": party.user_id,
+                                    })
+                                }).collect::<Vec<_>>()
+                            }).unwrap_or_default();
+
+                            // Calculate participant summary statistics
+                            let participant_summary = call.parties.as_ref().map(|parties| {
+                                let internal_count = parties.iter().filter(|p| {
+                                    matches!(p.affiliation, Some(ref a) if format!("{:?}", a) == "Internal")
+                                }).count();
+                                let external_count = parties.iter().filter(|p| {
+                                    matches!(p.affiliation, Some(ref a) if format!("{:?}", a) == "External")
+                                }).count();
+                                json!({
+                                    "total": parties.len(),
+                                    "internal": internal_count,
+                                    "external": external_count,
+                                })
+                            }).unwrap_or(json!({"total": 0, "internal": 0, "external": 0}));
+
                             json!({
                                 "id": meta.and_then(|m| m.id.as_ref()).unwrap_or(&String::new()),
                                 "title": meta.and_then(|m| m.title.as_ref()).unwrap_or(&"Untitled".to_string()),
                                 "started": meta.and_then(|m| m.started.as_ref()).unwrap_or(&String::new()),
                                 "duration": meta.and_then(|m| m.duration).unwrap_or(0),
                                 "direction": meta.and_then(|m| m.direction.as_ref()).map(|d| format!("{:?}", d)).unwrap_or_default(),
-                                "parties": call.parties.as_ref().map(|p| json!(p)).unwrap_or(json!([])),
+                                "participants": participants,
+                                "participantSummary": participant_summary,
                                 "url": meta.and_then(|m| m.url.as_ref()).unwrap_or(&String::new()),
                             })
                         })
@@ -1122,5 +1346,112 @@ mod tests {
 
         assert_eq!(metadata_call_id, Some("123456"), "Metadata URI should extract call ID");
         assert_eq!(transcript_call_id, Some("123456"), "Transcript URI should extract call ID");
+    }
+
+    #[test]
+    fn test_participants_uri_parsing() {
+        // Valid participants URIs
+        let valid_uris = vec![
+            "gong://calls/123456/participants",
+            "gong://calls/abc-def-123/participants",
+            "gong://calls/call_id_123/participants",
+        ];
+
+        for uri in valid_uris {
+            let call_id = uri
+                .strip_prefix("gong://calls/")
+                .and_then(|s| s.strip_suffix("/participants"));
+            assert!(call_id.is_some(), "Failed to parse URI: {}", uri);
+            assert!(!call_id.unwrap().is_empty(), "Call ID is empty for URI: {}", uri);
+            // Should NOT contain /transcript
+            assert!(!call_id.unwrap().contains("/transcript"), "Participants URI should not contain /transcript: {}", uri);
+        }
+    }
+
+    #[test]
+    fn test_invalid_participants_uri_parsing() {
+        let invalid_uris = vec![
+            "gong://calls//participants",         // empty call ID
+            "gong://calls/participants",          // missing call ID
+            "gong://participants/123",            // wrong format
+            "gong://calls/123/participant",       // wrong suffix (singular)
+        ];
+
+        for uri in invalid_uris {
+            let call_id = uri
+                .strip_prefix("gong://calls/")
+                .and_then(|s| s.strip_suffix("/participants"));
+
+            if let Some(id) = call_id {
+                assert!(id.is_empty() || id == "participants", "Should have empty or invalid call ID for invalid URI: {}", uri);
+            }
+        }
+    }
+
+    #[test]
+    fn test_uri_disambiguation_with_participants() {
+        // Ensure we can distinguish between metadata, participants, and transcript
+        let metadata_uri = "gong://calls/123456";
+        let participants_uri = "gong://calls/123456/participants";
+        let transcript_uri = "gong://calls/123456/transcript";
+
+        // Metadata should not end with /participants or /transcript
+        assert!(!metadata_uri.ends_with("/participants"), "Metadata URI should not end with /participants");
+        assert!(!metadata_uri.ends_with("/transcript"), "Metadata URI should not end with /transcript");
+
+        // Participants should end with /participants
+        assert!(participants_uri.ends_with("/participants"), "Participants URI should end with /participants");
+        assert!(!participants_uri.ends_with("/transcript"), "Participants URI should not end with /transcript");
+
+        // Transcript should end with /transcript
+        assert!(transcript_uri.ends_with("/transcript"), "Transcript URI should end with /transcript");
+        assert!(!transcript_uri.ends_with("/participants"), "Transcript URI should not end with /participants");
+
+        // Extract call IDs
+        let metadata_call_id = metadata_uri.strip_prefix("gong://calls/");
+        let participants_call_id = participants_uri
+            .strip_prefix("gong://calls/")
+            .and_then(|s| s.strip_suffix("/participants"));
+        let transcript_call_id = transcript_uri
+            .strip_prefix("gong://calls/")
+            .and_then(|s| s.strip_suffix("/transcript"));
+
+        assert_eq!(metadata_call_id, Some("123456"), "Metadata URI should extract call ID");
+        assert_eq!(participants_call_id, Some("123456"), "Participants URI should extract call ID");
+        assert_eq!(transcript_call_id, Some("123456"), "Transcript URI should extract call ID");
+    }
+
+    #[test]
+    fn test_participant_summary_calculation() {
+        // Test affiliation filtering logic
+        use serde_json::Value;
+
+        let participants = vec![
+            json!({"affiliation": "Internal"}),
+            json!({"affiliation": "Internal"}),
+            json!({"affiliation": "External"}),
+            json!({"affiliation": "External"}),
+            json!({"affiliation": "External"}),
+            json!({"affiliation": "Unknown"}),
+        ];
+
+        // Simulate the counting logic
+        let internal_count = participants.iter().filter(|p| {
+            p.get("affiliation")
+                .and_then(Value::as_str)
+                .map(|a| a == "Internal")
+                .unwrap_or(false)
+        }).count();
+
+        let external_count = participants.iter().filter(|p| {
+            p.get("affiliation")
+                .and_then(Value::as_str)
+                .map(|a| a == "External")
+                .unwrap_or(false)
+        }).count();
+
+        assert_eq!(internal_count, 2, "Should have 2 internal participants");
+        assert_eq!(external_count, 3, "Should have 3 external participants");
+        assert_eq!(participants.len(), 6, "Should have 6 total participants");
     }
 }
