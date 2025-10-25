@@ -1,9 +1,9 @@
-use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, model::*, service::RequestContext};
-use serde_json::json;
-use std::sync::Arc;
 use gong_rs::apis::configuration::Configuration;
 use gong_rs::apis::{calls_api, users_api};
 use gong_rs::models;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, model::*, service::RequestContext};
+use serde_json::json;
+use std::sync::Arc;
 
 /// Gong MCP Server
 ///
@@ -319,11 +319,9 @@ impl ServerHandler for GongServer {
                     include_avatars: Some(false),
                 };
 
-                let users_data = users_api::list_users(config, params)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error("api_error", Some(json!({"error": e.to_string()})))
-                    })?;
+                let users_data = users_api::list_users(config, params).await.map_err(|e| {
+                    McpError::internal_error("api_error", Some(json!({"error": e.to_string()})))
+                })?;
 
                 // Format the users response
                 let formatted_response = if let Some(users) = users_data.users {
@@ -400,74 +398,79 @@ impl ServerHandler for GongServer {
                     let transcript_data = self._fetch_transcript(call_id).await?;
 
                     // Format the transcript response with metadata
-                    let formatted_response = if let Some(transcripts) = transcript_data.call_transcripts {
-                        if let Some(transcript) = transcripts.first() {
-                            let empty_string = String::new();
-                            let retrieved_call_id = transcript.call_id.as_ref().unwrap_or(&empty_string);
-                            let monologues = transcript.transcript.as_ref();
+                    let formatted_response =
+                        if let Some(transcripts) = transcript_data.call_transcripts {
+                            if let Some(transcript) = transcripts.first() {
+                                let empty_string = String::new();
+                                let retrieved_call_id =
+                                    transcript.call_id.as_ref().unwrap_or(&empty_string);
+                                let monologues = transcript.transcript.as_ref();
 
-                            // Extract sentences and speaker information from monologues
-                            let (all_sentences, speaker_ids): (Vec<_>, Vec<_>) = monologues
-                                .map(|m| {
-                                    m.iter()
-                                        .flat_map(|monologue| {
-                                            let speaker_id = monologue.speaker_id.clone();
-                                            monologue.sentences.as_ref().map(|sentences| {
-                                                sentences
-                                                    .iter()
-                                                    .map(|s| {
-                                                        (
-                                                            json!({
-                                                                "speakerId": speaker_id,
-                                                                "start": s.start,
-                                                                "end": s.end,
-                                                                "text": s.text,
-                                                            }),
-                                                            speaker_id.clone(),
-                                                        )
+                                // Extract sentences and speaker information from monologues
+                                let (all_sentences, speaker_ids): (Vec<_>, Vec<_>) = monologues
+                                    .map(|m| {
+                                        m.iter()
+                                            .flat_map(|monologue| {
+                                                let speaker_id = monologue.speaker_id.clone();
+                                                monologue
+                                                    .sentences
+                                                    .as_ref()
+                                                    .map(|sentences| {
+                                                        sentences
+                                                            .iter()
+                                                            .map(|s| {
+                                                                (
+                                                                    json!({
+                                                                        "speakerId": speaker_id,
+                                                                        "start": s.start,
+                                                                        "end": s.end,
+                                                                        "text": s.text,
+                                                                    }),
+                                                                    speaker_id.clone(),
+                                                                )
+                                                            })
+                                                            .collect::<Vec<_>>()
                                                     })
-                                                    .collect::<Vec<_>>()
+                                                    .unwrap_or_default()
                                             })
-                                            .unwrap_or_default()
-                                        })
-                                        .collect::<Vec<_>>()
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .unzip();
+
+                                // Get unique speakers
+                                let unique_speakers: std::collections::HashSet<_> =
+                                    speaker_ids.into_iter().flatten().collect();
+
+                                json!({
+                                    "callId": retrieved_call_id,
+                                    "monologues": monologues,
+                                    "sentences": all_sentences,
+                                    "metadata": {
+                                        "sentenceCount": all_sentences.len(),
+                                        "speakerCount": unique_speakers.len(),
+                                        "monologueCount": monologues.map(|m| m.len()).unwrap_or(0),
+                                    }
                                 })
-                                .unwrap_or_default()
-                                .into_iter()
-                                .unzip();
-
-                            // Get unique speakers
-                            let unique_speakers: std::collections::HashSet<_> =
-                                speaker_ids.into_iter().flatten().collect();
-
-                            json!({
-                                "callId": retrieved_call_id,
-                                "monologues": monologues,
-                                "sentences": all_sentences,
-                                "metadata": {
-                                    "sentenceCount": all_sentences.len(),
-                                    "speakerCount": unique_speakers.len(),
-                                    "monologueCount": monologues.map(|m| m.len()).unwrap_or(0),
-                                }
-                            })
+                            } else {
+                                return Err(McpError::resource_not_found(
+                                    "transcript_not_found",
+                                    Some(json!({
+                                        "callId": call_id,
+                                        "message": "No transcript found for this call"
+                                    })),
+                                ));
+                            }
                         } else {
                             return Err(McpError::resource_not_found(
                                 "transcript_not_found",
                                 Some(json!({
                                     "callId": call_id,
-                                    "message": "No transcript found for this call"
+                                    "message": "No transcript data returned from API"
                                 })),
                             ));
-                        }
-                    } else {
-                        return Err(McpError::resource_not_found(
-                            "transcript_not_found",
-                            Some(json!({
-                                "callId": call_id,
-                                "message": "No transcript data returned from API"
-                            })),
-                        ));
-                    };
+                        };
 
                     Ok(ReadResourceResult {
                         contents: vec![ResourceContents::text(
@@ -505,7 +508,9 @@ impl ServerHandler for GongServer {
                 uri_template: "gong://calls/{callId}/transcript".to_string(),
                 name: "Call Transcript".to_string(),
                 title: None,
-                description: Some("Retrieve the transcript for a specific Gong call by ID".to_string()),
+                description: Some(
+                    "Retrieve the transcript for a specific Gong call by ID".to_string(),
+                ),
                 mime_type: Some("application/json".to_string()),
             }
             .no_annotation(),
@@ -550,7 +555,11 @@ mod tests {
                 .strip_prefix("gong://calls/")
                 .and_then(|s| s.strip_suffix("/transcript"));
             assert!(call_id.is_some(), "Failed to parse URI: {}", uri);
-            assert!(!call_id.unwrap().is_empty(), "Call ID is empty for URI: {}", uri);
+            assert!(
+                !call_id.unwrap().is_empty(),
+                "Call ID is empty for URI: {}",
+                uri
+            );
         }
     }
 
@@ -558,10 +567,10 @@ mod tests {
     fn test_invalid_transcript_uri_parsing() {
         // Invalid transcript URIs
         let invalid_uris = vec![
-            "gong://calls//transcript",  // empty call ID
-            "gong://calls/transcript",    // missing call ID
-            "gong://transcript/123",      // wrong format
-            "gong://calls/123",           // missing /transcript
+            "gong://calls//transcript", // empty call ID
+            "gong://calls/transcript",  // missing call ID
+            "gong://transcript/123",    // wrong format
+            "gong://calls/123",         // missing /transcript
         ];
 
         for uri in invalid_uris {
@@ -570,7 +579,11 @@ mod tests {
                 .and_then(|s| s.strip_suffix("/transcript"));
 
             if let Some(id) = call_id {
-                assert!(id.is_empty(), "Should have empty call ID for invalid URI: {}", uri);
+                assert!(
+                    id.is_empty(),
+                    "Should have empty call ID for invalid URI: {}",
+                    uri
+                );
             }
         }
     }
