@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE_PATH=$(cat | jq -r '.tool_input.file_path'); if [[ \"$FILE_PATH\" == *.rs ]]; then rustfmt \"$FILE_PATH\" 2>/dev/null || true; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
